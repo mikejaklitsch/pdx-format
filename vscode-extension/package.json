@@ -1,0 +1,41 @@
+{
+  "name": "pdx-format",
+  "displayName": "PDX Format",
+  "description": "Formatter for Paradox Interactive script files (.txt, .gui)",
+  "version": "1.0.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Formatters"
+  ],
+  "activationEvents": [
+    "onLanguage:plaintext",
+    "onLanguage:paradox"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "paradox",
+        "aliases": ["Paradox Script", "pdx"],
+        "extensions": [".txt", ".gui"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "PDX Format",
+      "properties": {
+        "pdxFormat.formatterPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to pdx-format executable (leave empty for default ~/.local/bin/pdx-format)"
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "documentFormattingProvider": "true"
+  }
+}

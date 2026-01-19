@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""
+PDX Format - CLI formatter for Paradox Interactive script files
+
+Based on F1r3Pr1nc3's paradox-formatter logic_optimizer.py (MIT License)
+https://github.com/F1r3Pr1nc3/paradox-formatter
+
+Usage:
+    pdx-format <file> [<file>...]           Format files in place
+    pdx-format --check <file> [<file>...]   Check if files need formatting
+    pdx-format --diff <file>                Show diff of changes
+    pdx-format -                            Read from stdin, write to stdout
+"""
+import re
+import copy
+import sys
+import io
+import os
+import argparse
+from pathlib import Path
+
+# === Configuration ===
+USE_COUNT_TRIGGERS = False
+USE_ANY_TRIGGERS = False
+NO_COMPACT = False
+
+NON_ANY_TRIGGERS = {
+    "count_deposits", "count_end_cycle_systems", "count_exact_species",
+    "count_owned_pop_amount", "count_owned_workforce", "count_potential_war_participants",
+    "count_ship_size_in_system", "count_species", "count_species_traits",
+    "count_starbase_buildings", "count_starbase_modules", "count_starbase_sizes",
+    "count_systems_with_aura", "count_tech_options", "count_unlocked_active_accords",
+    "count_used_naval_cap", "count_war_participants",
+}
+
+NON_COUNT_TRIGGERS = {
+    "any_valid_lured_critter_fleet",
+    "any_available_random_trait_by_tag",
+    "any_available_random_trait_by_tag_evopred"
+}
+
+is_decimal_re = re.compile(r"^-?\d+(\.\d+)?$")
+negated_ops = {'>': '<=', '<': '>=', '>=': '<', '<=': '>', '!=': '=', '=': '!='}
+
+triggerScopes = r"leader|owner|controller|overlord|space_owner|(?:prev){1,4}|(?:from){1,4}|root|this|event_target:[\w@]+|owner_or_space_owner"
+SCOPES = triggerScopes + r"|design|megastructure|planet|ship|pop_group|fleet|cosmic_storm|capital_scope|sector_capital|capital_star|system_star|solar_system|star|orbit|army|ambient_object|species|owner_species|owner_main_species|founder_species|bypass|pop_faction|war|federation|starbase|deposit|sector|archaeological_site|first_contact|spy_network|espionage_operation|espionage_asset|agreement|situation|astral_rift"
+SCOPES_RE = re.compile(f"^(?:{SCOPES})$")
+RAW_BLOCKS = ('in_breach_of', 'inverted_switch')
+
+KEYWORDS_TO_LOWER_START = ('ROOT.', 'PREV.', 'FROM.', 'OWNER.', 'CONTROLLER.')
+KEYWORDS_TO_LOWER_END = ('.ROOT', '.PREV', '.FROM', '.OWNER', '.CONTROLLER')
+KEYWORDS_TO_LOWER = (
+    'ROOT', 'PREV', 'FROMFROM', 'FROMFROMFROM', 'FROMFROMFROMFROM', 'THIS',
+    'Owner', 'Controller', "From", "FromFrom", "Root", "Prev", 'BREAK', 'CONTINUE'
+)
+VAL_KEYWORDS_TO_LOWER = KEYWORDS_TO_LOWER + ('Yes', 'No', 'YES', 'NO', 'FROM', "From")
+KEYWORDS_TO_LOWER_LIST = KEYWORDS_TO_LOWER + ('FROM', 'OWNER', 'EFFECT', 'TRIGGER', 'SWITCH', 'IF', 'ELSE', 'ELSE_IF', 'LIMIT', 'WHILE')
+
+EXPLICIT_LOGIC_KEYS = {'OR', 'NOR', 'NAND', 'NOT', 'calc_true_if'}
+KEYWORDS_TO_UPPER = {'OR', 'NOR', 'NAND', 'NOT', 'AND'}
+NON_NEGATABLE_SCOPES = ('if', 'else_if', 'else', 'while', 'switch', 'calc_true_if')
+
+compact_nodes = ('_trigger', '_condition', '_weight', '_score', '_mult', '_factor')
+not_compact_nodes = ('potential', 'allow', 'effect')
+
+
+def format_comment(val):
+    if not val.startswith('##'):
+        if len(val) > 1 and not val[1].isspace():
+            return f"# {val[1:]}"
+    return val
+
+
+def tokenize(text):
+    token_pattern = re.compile(r'(#.*)|("[^"]*")|(@\\?\[[^\]]+\])|(\[\[!?[^\]]*\])|(\?=|!=|>=|<=|[=\{\}<>!?])|([^\s=\{\}<>!?]+)|\n')
+    tokens = []
+    current_line = 1
+    last_idx = 0
+    for match in token_pattern.finditer(text):
+        start, end = match.span()
+        val = match.group(0)
+        gap = text[last_idx:start]
+        last_idx = end
+        if val == '\n':
+            current_line += 1
+            continue
+        t_type = ''
+        if match.group(1): t_type = 'comment'; val = format_comment(match.group(1))
+        elif match.group(2): t_type = 'str'; val = match.group(2)
+        elif match.group(3):
+            t_type = 'word'
+            val = match.group(3)
+            current_line += val.count('\n')
+        elif match.group(4):
+            t_type = 'word'
+            val = match.group(4)
+            current_line += val.count('\n')
+        elif match.group(5): t_type = 'op'; val = match.group(5)
+        elif match.group(6): t_type = 'word'; val = match.group(6)
+        else: continue
+        tokens.append({'type': t_type, 'val': val, 'line': current_line, 'pre': gap, 'start': start, 'end': end})
+    return tokens
+
+
+def parse(tokens, text):
+    stack = []
+    current_list = []
+    i = 0
+    preceding_comments_buffer = []
+
+    while i < len(tokens):
+        token = tokens[i]
+        token_line = token['line']
+        token_val = token['val']
+
+        # Handle raw blocks (switch, inverted_switch)
+        if token['type'] == 'word' and token_val in RAW_BLOCKS:
+            op_idx = i + 1
+            while op_idx < len(tokens) and tokens[op_idx]['type'] == 'comment':
+                op_idx += 1
+            if op_idx < len(tokens) and tokens[op_idx]['val'] == '=':
+                brace_idx = op_idx + 1
+                while brace_idx < len(tokens) and tokens[brace_idx]['type'] == 'comment':
+                    brace_idx += 1
+                if brace_idx < len(tokens) and tokens[brace_idx]['val'] == '{':
+                    brace_level = 1
+                    start_token = token
+                    end_token = None
+                    scan_idx = brace_idx + 1
+                    while scan_idx < len(tokens):
+                        scan_token = tokens[scan_idx]
+                        if scan_token['val'] == '{':
+                            brace_level += 1
+                        elif scan_token['val'] == '}':
+                            brace_level -= 1
+                        if brace_level == 0:
+                            end_token = scan_token
+                            break
+                        scan_idx += 1
+                    if end_token:
+                        preceding_comments_buffer = []
+                        raw_text = text[start_token['start']:end_token['end']]
+                        node = {'type': 'raw_block', 'val': raw_text}
+                        current_list.append(node)
+                        i = scan_idx + 1
+                        continue
+
+        def get_inline_comment_and_offset(current_idx, current_line_num):
+            if current_idx + 1 < len(tokens):
+                next_t = tokens[current_idx + 1]
+                if next_t['type'] == 'comment' and next_t['line'] == current_line_num:
+                    return next_t['pre'] + next_t['val'], 1
+            return None, 0
+
+        if token['type'] == 'comment':
+            current_list.append(token)
+            preceding_comments_buffer.append(token)
+            i += 1
+            continue
+
+        if token_val == "}":
+            if not stack: break
+            finished_list = current_list
+            current_list = stack.pop()
+            if current_list and current_list[-1].get('val') == 'PENDING_BLOCK':
+                parent_node = current_list[-1]
+                parent_node['val'] = finished_list
+                if parent_node.get('key') == 'switch' and '_token_start' in parent_node:
+                    parent_node['_raw'] = text[parent_node['_token_start']:token['end']]
+                cm, offset = get_inline_comment_and_offset(i, token_line)
+                if cm:
+                    parent_node['_cm_close'] = cm
+                    i += offset
+            preceding_comments_buffer = []
+            i += 1
+            continue
+
+        elif token_val == "{":
+            if current_list and current_list[-1].get('val') == 'PENDING_BLOCK':
+                cm, offset = get_inline_comment_and_offset(i, token_line)
+                if cm:
+                    current_list[-1]['_cm_open'] = cm
+                    i += offset
+            stack.append(current_list)
+            current_list = []
+            i += 1
+            continue
+
+        else:
+            # Comprehensive lookahead to determine token pattern
+            # Patterns to handle:
+            #   word {                  → key { block }
+            #   word = value            → key = value
+            #   word = value {          → key = val_key { block }
+            #   word word {             → key val_key { block }  (GUI: types Name {)
+            #   word "str" {            → key val_key { block }  (GUI: block "name" {)
+            #   word word = word {      → key mid_key = val_key { block }  (GUI: type name = parent {)
+
+            # Collect upcoming tokens (skip comments)
+            lookahead = []
+            temp_idx = i + 1
+            while temp_idx < len(tokens) and len(lookahead) < 5:
+                t = tokens[temp_idx]
+                if t['type'] != 'comment':
+                    lookahead.append((temp_idx, t))
+                temp_idx += 1
+
+            # Determine pattern
+            node = None
+            skip_to = None
+
+            if len(lookahead) >= 1:
+                t1_idx, t1 = lookahead[0]
+
+                # Pattern: word {
+                if t1['val'] == '{':
+                    node = {'key': token_val, 'op': None, 'val': 'PENDING_BLOCK', 'type': 'node', '_token_start': token['start']}
+                    skip_to = t1_idx
+
+                # Pattern: word = ...
+                elif t1['type'] == 'op' and t1['val'] not in ['{', '}']:
+                    operator = t1['val']
+                    if len(lookahead) >= 2:
+                        t2_idx, t2 = lookahead[1]
+                        # word = {
+                        if t2['val'] == '{':
+                            node = {'key': token_val, 'op': operator, 'val': 'PENDING_BLOCK', 'type': 'node', '_token_start': token['start']}
+                            skip_to = t2_idx
+                        # word = value ...
+                        elif t2['type'] in ['word', 'str']:
+                            if len(lookahead) >= 3:
+                                t3_idx, t3 = lookahead[2]
+                                # word = value {
+                                if t3['val'] == '{':
+                                    node = {'key': token_val, 'op': operator, 'val_key': t2['val'], 'val': 'PENDING_BLOCK', 'type': 'node', '_token_start': token['start']}
+                                    skip_to = t3_idx
+                            # word = value (no block)
+                            if node is None:
+                                node = {'key': token_val, 'op': operator, 'val': t2['val'], 'type': 'node'}
+                                cm, offset = get_inline_comment_and_offset(t2_idx, t2['line'])
+                                if cm:
+                                    node['_cm_inline'] = cm
+                                    t2_idx += offset
+                                skip_to = t2_idx + 1
+
+                # Pattern: word word ... or word "str" ...
+                elif t1['type'] in ['word', 'str']:
+                    mid_val = t1['val']
+                    if len(lookahead) >= 2:
+                        t2_idx, t2 = lookahead[1]
+                        # word word { or word "str" {
+                        if t2['val'] == '{':
+                            node = {'key': token_val, 'op': None, 'val_key': mid_val, 'val': 'PENDING_BLOCK', 'type': 'node', '_token_start': token['start']}
+                            skip_to = t2_idx
+                        # word word = ...
+                        elif t2['type'] == 'op' and t2['val'] not in ['{', '}']:
+                            operator = t2['val']
+                            if len(lookahead) >= 3:
+                                t3_idx, t3 = lookahead[2]
+                                # word word = value
+                                if t3['type'] in ['word', 'str']:
+                                    if len(lookahead) >= 4:
+                                        t4_idx, t4 = lookahead[3]
+                                        # word word = value {  (GUI: type name = parent {)
+                                        if t4['val'] == '{':
+                                            node = {'key': token_val, 'op': operator, 'mid_key': mid_val, 'val_key': t3['val'], 'val': 'PENDING_BLOCK', 'type': 'node', '_token_start': token['start']}
+                                            skip_to = t4_idx
+                                    # word word = value (no block) - treat as two separate: word word, then continue
+                                    if node is None:
+                                        node = {'key': token_val, 'op': None, 'val_key': mid_val, 'val': 'PENDING_BLOCK', 'type': 'node', '_token_start': token['start']}
+                                        skip_to = t2_idx
+
+            # Create node if pattern matched
+            if node and node.get('val') == 'PENDING_BLOCK':
+                if preceding_comments_buffer:
+                    node['_cm_preceding'] = [c['val'] for c in preceding_comments_buffer]
+                    preceding_comments_buffer = []
+                current_list.append(node)
+                i = skip_to
+                continue
+            elif node:
+                if preceding_comments_buffer:
+                    node['_cm_preceding'] = [c['val'] for c in preceding_comments_buffer]
+                    preceding_comments_buffer = []
+                current_list.append(node)
+                i = skip_to
+                continue
+
+            # Fallback: standalone word with no following pattern
+            node = {'key': token_val, 'val': None, 'type': 'node'}
+            if preceding_comments_buffer:
+                node['_cm_preceding'] = [c['val'] for c in preceding_comments_buffer]
+                preceding_comments_buffer = []
+            cm, offset = get_inline_comment_and_offset(i, token_line)
+            if cm:
+                node['_cm_inline'] = cm
+                i += offset
+            current_list.append(node)
+            i += 1
+            continue
+        i += 1
+    return current_list
+
+
+def nodes_are_equal(n1, n2):
+    if n1['type'] != n2['type']: return False
+    if n1['type'] == 'comment': return n1['val'] == n2['val']
+    if n1.get('key') != n2.get('key'): return False
+    if n1.get('op') != n2.get('op'): return False
+    v1, v2 = n1.get('val'), n2.get('val')
+    if isinstance(v1, list) and isinstance(v2, list):
+        c1 = [x for x in v1 if x['type'] == 'node']
+        c2 = [x for x in v2 if x['type'] == 'node']
+        if len(c1) != len(c2): return False
+        for i in range(len(c1)):
+            if not nodes_are_equal(c1[i], c2[i]): return False
+        return True
+    return v1 == v2
+
+
+def lowercase_keys(node_list):
+    changed = False
+    for node in node_list:
+        if node['type'] == 'node':
+            is_block = isinstance(node.get('val'), list)
+            if 'key' in node:
+                original_key = node['key']
+                if original_key in KEYWORDS_TO_LOWER or original_key.endswith(KEYWORDS_TO_LOWER_END) or original_key.startswith(KEYWORDS_TO_LOWER_START) or (is_block and original_key in KEYWORDS_TO_LOWER_LIST):
+                    lower_key = original_key.lower()
+                    if original_key != lower_key:
+                        node['key'] = lower_key
+                        changed = True
+            if is_block:
+                child_changed = lowercase_keys(node['val'])
+                if child_changed:
+                    changed = True
+    return changed
+
+
+def uppercase_keys(node_list):
+    changed = False
+    for node in node_list:
+        if node['type'] == 'node':
+            if 'key' in node and isinstance(node.get('val'), list):
+                original_key = node['key']
+                upper_key = original_key.upper()
+                if upper_key in KEYWORDS_TO_UPPER and original_key != upper_key:
+                    node['key'] = upper_key
+                    changed = True
+            if isinstance(node.get('val'), list):
+                child_changed = uppercase_keys(node['val'])
+                if child_changed:
+                    changed = True
+    return changed
+
+
+def lowercase_yes_no_values(node_list):
+    changed = False
+    for node in node_list:
+        if node['type'] == 'node':
+            val = node.get('val')
+            if isinstance(val, list):
+                child_changed = lowercase_yes_no_values(node['val'])
+                if child_changed:
+                    changed = True
+            elif val in VAL_KEYWORDS_TO_LOWER:
+                node['val'] = val.lower()
+                changed = True
+    return changed
+
+
+def optimize_node_list(node_list):
+    """Simplified optimizer - just returns the node list unchanged for basic formatting"""
+    return node_list, False
+
+
+def should_be_compact(node):
+    if node.get('type') != 'node': return False
+    val = node.get('val')
+    if not isinstance(val, list): return False
+
+    key = node.get('key', '')
+    cm_close = node.get('_cm_close', "")
+
+    # Check all children for comments first (before filtering)
+    for c in val:
+        if c.get('type') == 'comment': return False
+
+    children = [c for c in val if c['type'] == 'node']
+
+    if len(children) > 4: return False
+    if key.endswith(not_compact_nodes): return False
+    # Never compact logical operators - always expand for readability
+    if key in KEYWORDS_TO_UPPER: return False
+
+    total_len = len(key) + 6
+    for child in children:
+        if child.get('_cm_preceding'): return False
+        if child.get('_cm_open'): return False
+        if child.get('_cm_inline'): return False
+        if child.get('_cm_close'): return False
+        child_key = child.get('key', '')
+        child_val = child.get('val')
+
+        if isinstance(child_val, list):
+            if len([c for c in child_val if c['type'] == 'node']) > 2: return False
+            if not should_be_compact(child): return False
+            child_len = sum(len(c.get('key','')) + len(str(c.get('val',''))) + 5 for c in child_val if c['type'] == 'node')
+            child_len += len(child_key) + 6
+        else:
+            child_len = len(child_key) + len(str(child_val or '')) + 5
+        total_len += child_len
+
+    if key.endswith(compact_nodes):
+        total_len /= 2
+    if total_len > 80 and not cm_close: return False
+    return True
+
+
+def node_to_string(node, depth=0, be_compact=False):
+    indent = "\t" * depth
+    if node.get('type') == 'comment':
+        return f"{indent}{node['val'].rstrip()}"
+    if node.get('type') == 'raw_block':
+        content_to_indent = node['val'].rstrip().rstrip('}').rstrip()
+        content_to_indent += f'\n{indent}}}'
+        return f"{indent}{content_to_indent}"
+
+    key = node.get('key')
+    op = node.get('op')
+
+    if isinstance(node.get('val'), list):
+        children = node['val']
+        cm_open = node.get('_cm_open', "")
+        cm_close = node.get('_cm_close', "")
+        is_compactable = False
+
+        if (
+            not NO_COMPACT and
+            not be_compact and
+            depth and
+            (depth > 1 or key.endswith(compact_nodes)) and
+            not key.endswith(not_compact_nodes)
+        ):
+            is_compactable = should_be_compact(node)
+
+        if be_compact or is_compactable:
+            child_strs = []
+            is_compactable = True
+            for c in children:
+                if not be_compact and not cm_close:
+                    if c.get('_cm_inline'):
+                        cm_close = c.get('_cm_inline', '')
+                        del c['_cm_inline']
+                    elif c.get('_cm_close'):
+                        cm_close = c.get('_cm_close', '')
+                        del c['_cm_close']
+                elif (be_compact or not cm_close) and (c.get('_cm_inline') or c.get('_cm_close')):
+                    be_compact = is_compactable = False
+                    break
+                if is_compactable:
+                    s = node_to_string(c, depth=-1, be_compact=True)
+                    child_strs.append(s)
+            if is_compactable:
+                joined_children = " ".join(child_strs)
+                mid_key_str = f" {node.get('mid_key')}" if node.get('mid_key') else ""
+                op_str = f" {op}" if op else ""
+                val_key_str = f" {node.get('val_key')}" if node.get('val_key') else ""
+                return f"{indent}{key}{mid_key_str}{op_str}{val_key_str} {{ {joined_children} }}{cm_close}"
+
+        mid_key_str = f" {node.get('mid_key')}" if node.get('mid_key') else ""
+        op_str = f" {op}" if op else ""
+        val_key_str = f" {node.get('val_key')}" if node.get('val_key') else ""
+        # GUI 'types' declarations need brace on new line
+        if key == 'types' and val_key_str and not op:
+            lines = [f"{indent}{key}{val_key_str}", f"{indent}{{{cm_open}"]
+        else:
+            lines = [f"{indent}{key}{mid_key_str}{op_str}{val_key_str} {{{cm_open}"]
+        prev_was_header = False
+        prev_was_comment = False
+        prev_is_block = False
+
+        for i, child in enumerate(children):
+            is_comment = child.get('type') == 'comment'
+            is_block = isinstance(child.get('val'), list)
+            child_key = child.get('key')
+
+            comment_is_header = False
+            if is_comment:
+                comment_is_header = child.get('val').startswith('##')
+
+            if i and not depth:
+                add_space = False
+                if (not is_comment and (not prev_was_comment or prev_was_header)) or \
+                   (comment_is_header and not prev_was_comment) or \
+                   (is_comment and prev_is_block):
+                    if is_block or prev_is_block:
+                        add_space = True
+
+                if add_space and is_block:
+                    if child_key in NON_NEGATABLE_SCOPES or child_key.endswith(compact_nodes) or child_key in KEYWORDS_TO_UPPER:
+                        add_space = False
+                    else:
+                        prev_node_real = None
+                        for j in range(i - 1, -1, -1):
+                            if children[j].get('type') != 'comment':
+                                prev_node_real = children[j]
+                                break
+                        if prev_node_real and isinstance(prev_node_real.get('val'), list):
+                            prev_key = prev_node_real.get('key')
+                            if child_key == prev_key:
+                                add_space = False
+                            elif prev_key and (prev_key in NON_NEGATABLE_SCOPES or prev_key.endswith(compact_nodes) or prev_key in KEYWORDS_TO_UPPER):
+                                add_space = False
+                        else:
+                            if prev_node_real and prev_node_real.get('key') in ("exists", "optimize_memory"):
+                                add_space = False
+
+                if add_space:
+                    lines.append("")
+
+            lines.append(node_to_string(child, depth + 1))
+            prev_was_header = comment_is_header
+            prev_was_comment = is_comment
+            prev_is_block = is_block
+
+        lines.append(f"{indent}}}{cm_close}")
+        formatted_str = "\n".join(lines)
+
+        if node.get('_raw') and node.get('key') == 'switch':
+            raw_val = node['_raw']
+            if raw_val.count('\n') < formatted_str.count('\n'):
+                content_to_indent = raw_val.rstrip().rstrip('}').rstrip()
+                content_to_indent += f'\n{indent}}}'
+                return f"{indent}{content_to_indent}"
+
+        return formatted_str
+
+    else:
+        val = node.get('val')
+        cm_inline = node.get('_cm_inline', "")
+        if cm_inline and not cm_inline[0].isspace():
+            cm_inline = " " + cm_inline
+        if val is None: return f"{indent}{key}{cm_inline}"
+        op_str = f" {op}" if op else ""
+        return f"{indent}{key}{op_str} {val}{cm_inline}"
+
+
+def block_to_string(block_list):
+    lines = []
+    prev_was_header = False
+    prev_was_comment = False
+    prev_is_block = False
+    i = 0
+
+    for node in block_list:
+        is_comment_node = node['type'] == 'comment'
+        comment_is_header = False
+        is_var = False
+        key = None
+        is_block = False
+
+        if is_comment_node:
+            comment_text = node['val'][1:]
+            comment_is_header = comment_text.startswith(('#', '}', ' }'))
+        else:
+            comment_is_header = False
+            if node['type'] == 'node':
+                is_block = isinstance(node['val'], list)
+                key = node.get('key', '')
+                if key and not is_block and key.startswith('@'):
+                    is_var = True
+            elif node['type'] == 'raw_block':
+                is_block = True
+
+        if (
+            (not is_comment_node and not is_var and
+             (not prev_was_comment or prev_was_header or is_block)) or
+            (comment_is_header and not prev_was_comment and i) or
+            (is_comment_node and prev_is_block)
+        ):
+            lines.append("")
+        i += 1
+        prev_was_header = comment_is_header
+        prev_was_comment = is_comment_node
+        prev_is_block = is_block
+
+        cm_open = node.get('_cm_open')
+        node_to_print = node
+        if node['type'] == 'node' and is_block and cm_open:
+            lines.append(cm_open.strip())
+            node_to_print = node.copy()
+            del node_to_print['_cm_open']
+
+        lines.append(node_to_string(node_to_print, depth=0))
+    return "\n".join(lines)
+
+
+def process_text(content):
+    try:
+        original_content = content
+        content = content.replace('\r\n', '\n')
+        tokens = tokenize(content)
+        tree = parse(tokens, content)
+
+        lowercase_keys(tree)
+        uppercase_keys(tree)
+        lowercase_yes_no_values(tree)
+        optimized_tree, _ = optimize_node_list(tree)
+
+        new_content = block_to_string(optimized_tree)
+        if new_content and not new_content.endswith('\n'):
+            new_content += '\n'
+
+        if new_content != original_content:
+            return new_content, True
+        return original_content, False
+    except Exception as e:
+        print(f"Error processing: {e}", file=sys.stderr)
+        return content, False
+
+
+def format_file(filepath, check_only=False, show_diff=False):
+    """Format a single file. Returns True if file was changed/needs changes."""
+    has_bom = False
+    try:
+        # Check for BOM
+        with open(filepath, 'rb') as f:
+            has_bom = f.read(3) == b'\xef\xbb\xbf'
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}", file=sys.stderr)
+        return False
+
+    new_content, changed = process_text(content)
+
+    if not changed:
+        return False
+
+    if show_diff:
+        import difflib
+        diff = difflib.unified_diff(
+            content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{filepath}",
+            tofile=f"b/{filepath}"
+        )
+        sys.stdout.writelines(diff)
+        return True
+
+    if check_only:
+        return True
+
+    try:
+        # Preserve BOM if original had one
+        write_encoding = 'utf-8-sig' if has_bom else 'utf-8'
+        with open(filepath, 'w', encoding=write_encoding, newline='\n') as f:
+            f.write(new_content)
+        return True
+    except Exception as e:
+        print(f"Error writing {filepath}: {e}", file=sys.stderr)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Format Paradox Interactive script files (.txt, .gui)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  pdx-format file.txt                    Format file in place
+  pdx-format *.txt                       Format all .txt files
+  pdx-format --check file.txt            Check if formatting needed
+  pdx-format --diff file.txt             Show diff of changes
+  cat file.txt | pdx-format -            Format stdin to stdout
+        """
+    )
+    parser.add_argument('files', nargs='*', help='Files to format (use - for stdin)')
+    parser.add_argument('--check', action='store_true', help='Check if files need formatting (exit 1 if changes needed)')
+    parser.add_argument('--diff', action='store_true', help='Show diff of changes')
+    parser.add_argument('--no-compact', action='store_true', help='Disable compacting of small blocks')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress output except errors')
+
+    args = parser.parse_args()
+
+    if not args.files:
+        parser.print_help()
+        sys.exit(0)
+
+    global NO_COMPACT
+    NO_COMPACT = args.no_compact
+
+    # Handle stdin
+    if args.files == ['-']:
+        if sys.version_info >= (3, 7):
+            sys.stdin.reconfigure(encoding='utf-8')
+            sys.stdout.reconfigure(encoding='utf-8')
+        content = sys.stdin.read()
+        new_content, changed = process_text(content)
+        sys.stdout.write(new_content)
+        sys.exit(0)
+
+    # Process files
+    needs_formatting = []
+    formatted = []
+    errors = []
+
+    for filepath in args.files:
+        if not os.path.isfile(filepath):
+            errors.append(filepath)
+            if not args.quiet:
+                print(f"File not found: {filepath}", file=sys.stderr)
+            continue
+
+        changed = format_file(filepath, check_only=args.check, show_diff=args.diff)
+        if changed:
+            if args.check:
+                needs_formatting.append(filepath)
+            else:
+                formatted.append(filepath)
+
+    # Output results
+    if not args.quiet and not args.diff:
+        if args.check:
+            if needs_formatting:
+                print(f"Would reformat: {', '.join(needs_formatting)}")
+            else:
+                print("All files are formatted correctly")
+        else:
+            if formatted:
+                print(f"Formatted: {', '.join(formatted)}")
+
+    # Exit code
+    if args.check and needs_formatting:
+        sys.exit(1)
+    if errors:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
