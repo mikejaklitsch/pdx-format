@@ -23,6 +23,9 @@ from pathlib import Path
 USE_COUNT_TRIGGERS = False
 USE_ANY_TRIGGERS = False
 NO_COMPACT = False
+COMPACT_LIMIT = 4
+BLOCK_SPACING = 1
+ADD_BOM = True
 
 NON_ANY_TRIGGERS = {
     "count_deposits", "count_end_cycle_systems", "count_exact_species",
@@ -99,6 +102,10 @@ def tokenize(text):
         elif match.group(6): t_type = 'word'; val = match.group(6)
         else: continue
         tokens.append({'type': t_type, 'val': val, 'line': current_line, 'pre': gap, 'start': start, 'end': end})
+    # Mark tokens preceded by blank lines (line gap >= 2)
+    for idx in range(1, len(tokens)):
+        if tokens[idx]['line'] - tokens[idx - 1]['line'] >= 2:
+            tokens[idx]['_blank_before'] = True
     return tokens
 
 
@@ -141,6 +148,8 @@ def parse(tokens, text):
                         preceding_comments_buffer = []
                         raw_text = text[start_token['start']:end_token['end']]
                         node = {'type': 'raw_block', 'val': raw_text}
+                        if token.get('_blank_before'):
+                            node['_blank_before'] = True
                         current_list.append(node)
                         i = scan_idx + 1
                         continue
@@ -275,6 +284,8 @@ def parse(tokens, text):
                 if preceding_comments_buffer:
                     node['_cm_preceding'] = [c['val'] for c in preceding_comments_buffer]
                     preceding_comments_buffer = []
+                if token.get('_blank_before'):
+                    node['_blank_before'] = True
                 current_list.append(node)
                 i = skip_to
                 continue
@@ -282,6 +293,8 @@ def parse(tokens, text):
                 if preceding_comments_buffer:
                     node['_cm_preceding'] = [c['val'] for c in preceding_comments_buffer]
                     preceding_comments_buffer = []
+                if token.get('_blank_before'):
+                    node['_blank_before'] = True
                 current_list.append(node)
                 i = skip_to
                 continue
@@ -291,6 +304,8 @@ def parse(tokens, text):
             if preceding_comments_buffer:
                 node['_cm_preceding'] = [c['val'] for c in preceding_comments_buffer]
                 preceding_comments_buffer = []
+            if token.get('_blank_before'):
+                node['_blank_before'] = True
             cm, offset = get_inline_comment_and_offset(i, token_line)
             if cm:
                 node['_cm_inline'] = cm
@@ -388,7 +403,7 @@ def should_be_compact(node):
 
     children = [c for c in val if c['type'] == 'node']
 
-    if len(children) > 4: return False
+    if len(children) > COMPACT_LIMIT: return False
     if key.endswith(not_compact_nodes): return False
     # Never compact logical operators - always expand for readability
     if key in KEYWORDS_TO_UPPER: return False
@@ -479,23 +494,40 @@ def node_to_string(node, depth=0, be_compact=False):
         prev_was_header = False
         prev_was_comment = False
         prev_is_block = False
+        prev_is_expanded = False
 
         for i, child in enumerate(children):
             is_comment = child.get('type') == 'comment'
             is_block = isinstance(child.get('val'), list)
             child_key = child.get('key')
 
+            # Check if this block child would be rendered expanded (multi-line)
+            is_expanded = False
+            if is_block and child.get('type') == 'node':
+                child_depth = depth + 1
+                can_compact = (
+                    not NO_COMPACT and
+                    child_depth > 0 and
+                    (child_depth > 1 or (child_key or '').endswith(compact_nodes)) and
+                    not (child_key or '').endswith(not_compact_nodes)
+                )
+                is_expanded = not (can_compact and should_be_compact(child))
+
             comment_is_header = False
             if is_comment:
                 comment_is_header = child.get('val').startswith('##')
 
-            if i and not depth:
+            if i:
                 add_space = False
                 if (not is_comment and (not prev_was_comment or prev_was_header)) or \
                    (comment_is_header and not prev_was_comment) or \
                    (is_comment and prev_is_block):
-                    if is_block or prev_is_block:
-                        add_space = True
+                    if depth == 0:
+                        if is_block or prev_is_block:
+                            add_space = True
+                    else:
+                        if is_expanded or prev_is_expanded:
+                            add_space = True
 
                 if add_space and is_block:
                     if child_key in NON_NEGATABLE_SCOPES or child_key.endswith(compact_nodes) or child_key in KEYWORDS_TO_UPPER:
@@ -516,6 +548,10 @@ def node_to_string(node, depth=0, be_compact=False):
                             if prev_node_real and prev_node_real.get('key') in ("exists", "optimize_memory"):
                                 add_space = False
 
+                # Preserve user's intentional blank lines
+                if not add_space and child.get('_blank_before'):
+                    add_space = True
+
                 if add_space:
                     lines.append("")
 
@@ -523,6 +559,7 @@ def node_to_string(node, depth=0, be_compact=False):
             prev_was_header = comment_is_header
             prev_was_comment = is_comment
             prev_is_block = is_block
+            prev_is_expanded = is_expanded
 
         lines.append(f"{indent}}}{cm_close}")
         formatted_str = "\n".join(lines)
@@ -573,13 +610,19 @@ def block_to_string(block_list):
             elif node['type'] == 'raw_block':
                 is_block = True
 
-        if (
+        add_space = (
             (not is_comment_node and not is_var and
              (not prev_was_comment or prev_was_header or is_block)) or
             (comment_is_header and not prev_was_comment and i) or
             (is_comment_node and prev_is_block)
-        ):
-            lines.append("")
+        )
+        # Preserve user's intentional blank lines
+        if not add_space and i and node.get('_blank_before'):
+            add_space = True
+        if add_space:
+            # Use configured spacing after top-level blocks
+            count = BLOCK_SPACING if prev_is_block else 1
+            lines.extend([""] * count)
         i += 1
         prev_was_header = comment_is_header
         prev_was_comment = is_comment_node
@@ -596,11 +639,20 @@ def block_to_string(block_list):
     return "\n".join(lines)
 
 
-def process_text(content):
+def process_text(content, filepath=None):
     try:
         original_content = content
         content = content.replace('\r\n', '\n')
         tokens = tokenize(content)
+
+        # Guard against malformed input - mismatched braces cause data loss
+        open_count = sum(1 for t in tokens if t['type'] == 'op' and t['val'] == '{')
+        close_count = sum(1 for t in tokens if t['type'] == 'op' and t['val'] == '}')
+        if open_count != close_count:
+            label = filepath or "<input>"
+            print(f"Error: {label}: mismatched braces ({open_count} open, {close_count} close), skipping to prevent data loss", file=sys.stderr)
+            return content, False
+
         tree = parse(tokens, content)
 
         lowercase_keys(tree)
@@ -633,9 +685,13 @@ def format_file(filepath, check_only=False, show_diff=False):
         print(f"Error reading {filepath}: {e}", file=sys.stderr)
         return False
 
-    new_content, changed = process_text(content)
+    new_content, changed = process_text(content, filepath)
 
-    if not changed:
+    # Determine target encoding
+    want_bom = ADD_BOM or has_bom
+    bom_changed = want_bom != has_bom
+
+    if not changed and not bom_changed:
         return False
 
     if show_diff:
@@ -653,8 +709,7 @@ def format_file(filepath, check_only=False, show_diff=False):
         return True
 
     try:
-        # Preserve BOM if original had one
-        write_encoding = 'utf-8-sig' if has_bom else 'utf-8'
+        write_encoding = 'utf-8-sig' if want_bom else 'utf-8'
         with open(filepath, 'w', encoding=write_encoding, newline='\n') as f:
             f.write(new_content)
         return True
@@ -680,6 +735,9 @@ Examples:
     parser.add_argument('--check', action='store_true', help='Check if files need formatting (exit 1 if changes needed)')
     parser.add_argument('--diff', action='store_true', help='Show diff of changes')
     parser.add_argument('--no-compact', action='store_true', help='Disable compacting of small blocks')
+    parser.add_argument('--compact-limit', type=int, default=4, metavar='N', help='Max key-value pairs in a compact single-line block (default: 4)')
+    parser.add_argument('--block-spacing', type=int, default=1, metavar='N', help='Blank lines between top-level blocks (default: 1)')
+    parser.add_argument('--no-bom', action='store_true', help='Do not add UTF-8 BOM (BOM is added by default)')
     parser.add_argument('-q', '--quiet', action='store_true', help='Suppress output except errors')
 
     args = parser.parse_args()
@@ -688,8 +746,11 @@ Examples:
         parser.print_help()
         sys.exit(0)
 
-    global NO_COMPACT
+    global NO_COMPACT, COMPACT_LIMIT, BLOCK_SPACING, ADD_BOM
     NO_COMPACT = args.no_compact
+    COMPACT_LIMIT = args.compact_limit
+    BLOCK_SPACING = args.block_spacing
+    ADD_BOM = not args.no_bom
 
     # Handle stdin
     if args.files == ['-']:
