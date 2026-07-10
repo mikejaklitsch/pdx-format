@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Pinpoint brace imbalance in PDX script files.
+
+Thin alias for `pdx-format --brace` — the checker now lives in the
+pdx-format package (pdx_format/brace.py). Kept so existing docs and
+muscle memory (`pdx-brace <file|dir> [--context N]`) keep working.
+
+Usage:
+    pdx-brace <file>                # check one file
+    pdx-brace <dir>                 # check all .txt/.gui recursively
+    pdx-brace <file> --context 5    # show 5 lines of context (default 2)
+    ... | pdx-brace -               # check stdin
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path("/mnt/c/Users/Mjaklitsch/Documents/pdx-format")))
+from pdx_format.cli import main
+
+if len(sys.argv) < 2:
+    print(__doc__.strip())
+    sys.exit(1)
+
+sys.argv = [sys.argv[0], '--brace'] + sys.argv[1:]
+main()
