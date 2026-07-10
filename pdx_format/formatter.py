@@ -23,7 +23,6 @@ def _is_expanded_block(child, depth, config):
     can_compact = (
         not config.no_compact and
         child_depth > 0 and
-        (child_depth > 1 or child_key.endswith(COMPACT_SUFFIXES)) and
         not child_key.endswith(NON_COMPACT_SUFFIXES)
     )
     return not (can_compact and should_be_compact(child, config))
@@ -51,18 +50,19 @@ def _should_add_blank_within_block(child, i, children, depth, config,
 
     # Suppress blanks in certain cases
     if add_space and is_block:
-        if (child_key in NON_NEGATABLE_SCOPES or
-                child_key.endswith(COMPACT_SUFFIXES) or
+        # else/else_if must stay adjacent to their preceding if/else_if
+        if child_key in ('else', 'else_if'):
+            add_space = False
+        elif (child_key.endswith(COMPACT_SUFFIXES) or
                 child_key in KEYWORDS_TO_UPPER):
             add_space = False
         else:
             prev_node = _find_prev_non_comment(children, i)
             if prev_node and isinstance(prev_node.get('val'), list):
                 prev_key = prev_node.get('key')
-                if child_key == prev_key:
+                if child_key == prev_key and child_key not in NON_NEGATABLE_SCOPES:
                     add_space = False
-                elif prev_key and (prev_key in NON_NEGATABLE_SCOPES or
-                                   prev_key.endswith(COMPACT_SUFFIXES) or
+                elif prev_key and (prev_key.endswith(COMPACT_SUFFIXES) or
                                    prev_key in KEYWORDS_TO_UPPER):
                     add_space = False
             elif prev_node and prev_node.get('key') in ("exists", "optimize_memory"):
@@ -71,6 +71,12 @@ def _should_add_blank_within_block(child, i, children, depth, config,
     # Preserve user's intentional blank lines
     if not add_space and child.get('_blank_before'):
         add_space = True
+
+    # Suppress blanks inside small parent blocks (e.g. set_variable with name + value)
+    if add_space and depth > 0:
+        real_children = [c for c in children if c.get('type') != 'comment']
+        if len(real_children) <= config.compact_limit:
+            add_space = False
 
     return add_space
 
@@ -97,8 +103,6 @@ def should_be_compact(node, config):
         return False
     if key.endswith(NON_COMPACT_SUFFIXES):
         return False
-    if key in KEYWORDS_TO_UPPER:
-        return False
 
     total_len = len(key) + 6
     for child in children:
@@ -110,7 +114,7 @@ def should_be_compact(node, config):
         child_val = child.get('val')
 
         if isinstance(child_val, list):
-            if len([c for c in child_val if c['type'] == 'node']) > 2:
+            if len([c for c in child_val if c['type'] == 'node']) > config.compact_limit:
                 return False
             if not should_be_compact(child, config):
                 return False
@@ -123,9 +127,7 @@ def should_be_compact(node, config):
             child_len = len(child_key) + len(str(child_val or '')) + 5
         total_len += child_len
 
-    if key.endswith(COMPACT_SUFFIXES):
-        total_len /= 2
-    if total_len > 80 and not cm_close:
+    if total_len > config.compact_max_chars and not cm_close:
         return False
     return True
 
@@ -138,7 +140,12 @@ def node_to_string(node, depth=0, *, config, be_compact=False):
         return f"{indent}{node['val'].rstrip()}"
 
     if node.get('type') == 'raw_block':
-        content = node['val'].rstrip().rstrip('}').rstrip()
+        raw = node['val'].rstrip()
+        # Single-line raw blocks: preserve as-is with indentation
+        if '\n' not in raw:
+            return f"{indent}{raw}"
+        # Multi-line raw blocks: re-indent closing brace
+        content = raw.rstrip('}').rstrip()
         return f"{indent}{content}\n{indent}}}"
 
     key = node.get('key')
@@ -171,7 +178,6 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
     # Try compact rendering
     is_compactable = False
     if (not config.no_compact and not be_compact and depth and
-            (depth > 1 or key.endswith(COMPACT_SUFFIXES)) and
             not key.endswith(NON_COMPACT_SUFFIXES)):
         is_compactable = should_be_compact(node, config)
 

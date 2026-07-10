@@ -11,6 +11,24 @@ Based on [F1r3Pr1nc3's paradox-formatter](https://github.com/F1r3Pr1nc3/paradox-
 - Preserves BOM encoding for GUI files
 - Never compacts logical operators (AND, OR, NOT, etc.)
 - Preserves comments and their positioning
+- Refuses malformed input (mismatched or mis-nested braces) instead of
+  truncating, and pinpoints the offending brace with context
+- Built-in brace checker (`--brace`, merged from the standalone pdx-brace
+  tool): comment- and string-aware — handles glued comments (`foo# }`),
+  braces in strings (`"}"`), and multi-line string blobs in generated files
+
+## Brace Checking
+
+```bash
+pdx-format --brace file.txt          # pinpoint unbalanced braces
+pdx-format --brace some/dir          # check all .txt/.gui recursively
+pdx-format --brace file.txt --context 5
+cat file.txt | pdx-format --brace -  # check stdin
+```
+
+`pdx-brace` remains available as a thin alias taking the same arguments.
+Formatting a file with brace problems automatically prints the same
+pinpoint report instead of a bare "mismatched braces" count.
 
 ## CLI Installation
 

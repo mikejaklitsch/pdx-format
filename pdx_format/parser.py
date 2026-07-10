@@ -10,6 +10,15 @@ The AST is a list of node dicts. Each node has:
 from .constants import RAW_BLOCKS
 
 
+class MisnestedBracesError(ValueError):
+    """Braces are mis-nested (e.g. a stray '}' before its '{') even though
+    total counts may match. Formatting must refuse rather than truncate."""
+
+    def __init__(self, line):
+        self.line = line
+        super().__init__(f"stray '}}' at line {line} closes nothing")
+
+
 def _get_inline_comment(tokens, current_idx, current_line):
     """Check if the next token is an inline comment on the same line.
 
@@ -67,6 +76,57 @@ def _parse_raw_block(tokens, text, token, i):
                     node['_blank_before'] = True
                 return node, scan_idx + 1
         scan_idx += 1
+
+    return None
+
+
+def _parse_block_weight_pattern(tokens, text, token, i):
+    """Try to parse { script_value } = { effects } pattern (random_list weights).
+
+    Returns (node, next_i) or None.
+    """
+    if token['val'] != '{':
+        return None
+
+    # Find matching close brace for the weight block
+    brace_level = 1
+    scan_idx = i + 1
+    while scan_idx < len(tokens):
+        if tokens[scan_idx]['val'] == '{':
+            brace_level += 1
+        elif tokens[scan_idx]['val'] == '}':
+            brace_level -= 1
+            if brace_level == 0:
+                break
+        scan_idx += 1
+    else:
+        return None
+
+    # Check if next non-comment token after } is =
+    eq_idx = _skip_comments(tokens, scan_idx + 1)
+    if eq_idx >= len(tokens) or tokens[eq_idx]['val'] != '=':
+        return None
+
+    # Find the block after =
+    block_idx = _skip_comments(tokens, eq_idx + 1)
+    if block_idx >= len(tokens) or tokens[block_idx]['val'] != '{':
+        return None
+
+    # Find matching close brace for the effects block
+    brace_level = 1
+    end_idx = block_idx + 1
+    while end_idx < len(tokens):
+        if tokens[end_idx]['val'] == '{':
+            brace_level += 1
+        elif tokens[end_idx]['val'] == '}':
+            brace_level -= 1
+            if brace_level == 0:
+                raw_text = text[token['start']:tokens[end_idx]['end']]
+                node = {'type': 'raw_block', 'val': raw_text}
+                if token.get('_blank_before'):
+                    node['_blank_before'] = True
+                return node, end_idx + 1
+        end_idx += 1
 
     return None
 
@@ -198,7 +258,8 @@ def parse(tokens, text):
         # Close brace
         if token_val == '}':
             if not stack:
-                break
+                # A silent break here would drop the rest of the file
+                raise MisnestedBracesError(token_line)
             finished_list = current_list
             current_list = stack.pop()
             if current_list and current_list[-1].get('val') == 'PENDING_BLOCK':
@@ -213,6 +274,17 @@ def parse(tokens, text):
             preceding_comments = []
             i += 1
             continue
+
+        # { script_value } = { effects } pattern (random_list weights)
+        if token_val == '{':
+            result = _parse_block_weight_pattern(tokens, text, token, i)
+            if result:
+                node, next_i = result
+                _attach_metadata(node, token, preceding_comments)
+                preceding_comments = []
+                current_list.append(node)
+                i = next_i
+                continue
 
         # Open brace (bare block without key)
         if token_val == '{':

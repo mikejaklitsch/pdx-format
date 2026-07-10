@@ -46,6 +46,7 @@ def tokenize(text):
         elif match.group(2):
             t_type = 'str'
             val = match.group(2)
+            current_line += val.count('\n')  # strings can span lines
         elif match.group(3):
             t_type = 'word'
             val = match.group(3)

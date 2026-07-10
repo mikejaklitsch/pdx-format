@@ -4,7 +4,35 @@ import os
 import argparse
 
 from .config import FormatConfig
+from .constants import BOM_ONLY_EXTENSIONS
 from .file_io import process_text, format_file
+from . import brace
+
+FORMAT_EXTENSIONS = {'.txt', '.gui'} | BOM_ONLY_EXTENSIONS
+
+
+def expand_targets(paths, extensions, quiet=False):
+    """Expand files and directories into a flat file list. Directories are
+    searched recursively for matching extensions, skipping tool/VCS dirs.
+    Returns (files, missing_count)."""
+    from pathlib import Path
+    files = []
+    missing = 0
+    for raw in paths:
+        p = Path(raw)
+        if p.is_file():
+            files.append(raw)
+        elif p.is_dir():
+            found = []
+            for ext in sorted(extensions):
+                found.extend(sorted(p.rglob(f"*{ext}")))
+            files.extend(str(f) for f in found
+                         if not brace.SKIP_PARTS.intersection(f.parts))
+        else:
+            missing += 1
+            if not quiet:
+                print(f"File not found: {raw}", file=sys.stderr)
+    return files, missing
 
 
 def main():
@@ -15,19 +43,29 @@ def main():
 Examples:
   pdx-format file.txt                    Format file in place
   pdx-format *.txt                       Format all .txt files
+  pdx-format some/dir                    Format a directory recursively
   pdx-format --check file.txt            Check if formatting needed
   pdx-format --diff file.txt             Show diff of changes
+  pdx-format --brace file.txt            Check brace balance only (pdx-brace)
   cat file.txt | pdx-format -            Format stdin to stdout
         """
     )
-    parser.add_argument('files', nargs='*', help='Files to format (use - for stdin)')
+    parser.add_argument('files', nargs='*',
+                        help='Files or directories to format (use - for stdin)')
     parser.add_argument('--check', action='store_true',
                         help='Check if files need formatting (exit 1 if changes needed)')
     parser.add_argument('--diff', action='store_true', help='Show diff of changes')
+    parser.add_argument('--brace', action='store_true',
+                        help='Check brace balance only, no formatting '
+                             '(exit 1 if problems found)')
+    parser.add_argument('--context', type=int, default=2, metavar='N',
+                        help='Context lines around --brace problems (default: 2)')
     parser.add_argument('--no-compact', action='store_true',
                         help='Disable compacting of small blocks')
-    parser.add_argument('--compact-limit', type=int, default=4, metavar='N',
-                        help='Max key-value pairs in a compact single-line block (default: 4)')
+    parser.add_argument('--compact-limit', type=int, default=2, metavar='N',
+                        help='Max key-value pairs in a compact single-line block (default: 2)')
+    parser.add_argument('--compact-max-chars', type=int, default=120, metavar='N',
+                        help='Max characters for a compact single-line block (default: 120)')
     parser.add_argument('--block-spacing', type=int, default=1, metavar='N',
                         help='Blank lines between top-level blocks (default: 1)')
     parser.add_argument('--no-bom', action='store_true',
@@ -41,18 +79,33 @@ Examples:
         parser.print_help()
         sys.exit(0)
 
+    # Brace-check mode (merged pdx-brace)
+    if args.brace:
+        if args.files == ['-']:
+            problems = brace.check_text(sys.stdin.read(), '<stdin>', args.context)
+            for p in problems:
+                print(p)
+                print()
+            if problems:
+                print(f"Found {len(problems)} brace problem"
+                      f"{'s' if len(problems) != 1 else ''}")
+            elif not args.quiet:
+                print("All balanced (stdin)")
+            sys.exit(1 if problems else 0)
+        sys.exit(brace.run_check(args.files, args.context, args.quiet))
+
     config = FormatConfig(
         no_compact=args.no_compact,
         compact_limit=args.compact_limit,
+        compact_max_chars=args.compact_max_chars,
         block_spacing=args.block_spacing,
         add_bom=not args.no_bom,
     )
 
     # Handle stdin
     if args.files == ['-']:
-        if sys.version_info >= (3, 7):
-            sys.stdin.reconfigure(encoding='utf-8')
-            sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding='utf-8')
         content = sys.stdin.read()
         new_content, _ = process_text(content, config)
         sys.stdout.write(new_content)
@@ -61,11 +114,12 @@ Examples:
     # Process files
     needs_formatting = []
     formatted = []
-    errors = []
+    files, missing = expand_targets(args.files, FORMAT_EXTENSIONS, args.quiet)
+    errors = missing > 0
 
-    for filepath in args.files:
+    for filepath in files:
         if not os.path.isfile(filepath):
-            errors.append(filepath)
+            errors = True
             if not args.quiet:
                 print(f"File not found: {filepath}", file=sys.stderr)
             continue
@@ -90,6 +144,4 @@ Examples:
 
     if args.check and needs_formatting:
         sys.exit(1)
-    if errors:
-        sys.exit(1)
-    sys.exit(0)
+    sys.exit(1 if errors else 0)

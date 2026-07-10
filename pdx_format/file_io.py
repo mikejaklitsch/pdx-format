@@ -5,13 +5,25 @@ import sys
 from .config import FormatConfig
 from .constants import BOM_ONLY_EXTENSIONS
 from .tokenizer import tokenize
-from .parser import parse
+from .parser import parse, MisnestedBracesError
 from .transforms import lowercase_keys, uppercase_keys, lowercase_yes_no_values
 from .formatter import block_to_string
+from .brace import check_text
+
+
+def _print_brace_pinpoint(content, label, limit=3):
+    """Show where the brace problem is, so 'skipping' is actionable."""
+    problems = check_text(content, label)
+    for p in problems[:limit]:
+        print(p, file=sys.stderr)
+    if len(problems) > limit:
+        print(f"  ... {len(problems) - limit} more "
+              f"(run: pdx-format --brace {label})", file=sys.stderr)
 
 
 def process_text(content, config, filepath=None):
     """Format PDX script text. Returns (new_content, changed)."""
+    label = filepath or "<input>"
     try:
         original_content = content
         content = content.replace('\r\n', '\n')
@@ -21,9 +33,9 @@ def process_text(content, config, filepath=None):
         open_count = sum(1 for t in tokens if t['type'] == 'op' and t['val'] == '{')
         close_count = sum(1 for t in tokens if t['type'] == 'op' and t['val'] == '}')
         if open_count != close_count:
-            label = filepath or "<input>"
             print(f"Error: {label}: mismatched braces ({open_count} open, {close_count} close), "
                   f"skipping to prevent data loss", file=sys.stderr)
+            _print_brace_pinpoint(content, label)
             return content, False
 
         tree = parse(tokens, content)
@@ -38,8 +50,13 @@ def process_text(content, config, filepath=None):
         if new_content != original_content:
             return new_content, True
         return original_content, False
+    except MisnestedBracesError as e:
+        print(f"Error: {label}: {e}, skipping to prevent data loss",
+              file=sys.stderr)
+        _print_brace_pinpoint(content, label)
+        return content, False
     except Exception as e:
-        print(f"Error processing: {e}", file=sys.stderr)
+        print(f"Error processing {label}: {e}", file=sys.stderr)
         return content, False
 
 
@@ -63,7 +80,7 @@ def bom_only_file(filepath, config, check_only=False, show_diff=False):
     """Add/remove BOM on files that shouldn't be reformatted. Returns True if changed."""
     try:
         content, has_bom = _read_file_with_bom(filepath)
-        want_bom = config.add_bom or has_bom
+        want_bom = config.add_bom
         if want_bom == has_bom:
             return False
     except Exception as e:
@@ -100,7 +117,7 @@ def format_file(filepath, config, check_only=False, show_diff=False):
 
     new_content, changed = process_text(content, config, filepath)
 
-    want_bom = config.add_bom or has_bom
+    want_bom = config.add_bom
     bom_changed = want_bom != has_bom
 
     if not changed and not bom_changed:
