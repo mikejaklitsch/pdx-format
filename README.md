@@ -14,8 +14,9 @@ Based on [F1r3Pr1nc3's paradox-formatter](https://github.com/F1r3Pr1nc3/paradox-
 - Refuses malformed input (mismatched or mis-nested braces) instead of
   truncating, and pinpoints the offending brace with context
 - Built-in brace checker (`--brace`, merged from the standalone pdx-brace
-  tool): comment- and string-aware — handles glued comments (`foo# }`),
-  braces in strings (`"}"`), and multi-line string blobs in generated files
+  tool): comment-aware and string-aware, so it handles glued comments
+  (`foo# }`), braces in strings (`"}"`), and multi-line string blobs in
+  generated files
 
 ## Brace Checking
 
