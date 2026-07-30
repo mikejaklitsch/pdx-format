@@ -78,6 +78,14 @@ def _should_add_blank_within_block(child, i, children, depth, config,
         if len(real_children) <= config.compact_limit:
             add_space = False
 
+    # Suppress blanks between consecutive compact one-liners with the same key
+    if add_space and is_block and not is_expanded:
+        prev_node = _find_prev_non_comment(children, i)
+        if (prev_node and isinstance(prev_node.get('val'), list) and
+                prev_node.get('key') == child_key and
+                not _is_expanded_block(prev_node, depth, config)):
+            add_space = False
+
     return add_space
 
 
@@ -119,12 +127,12 @@ def should_be_compact(node, config):
             if not should_be_compact(child, config):
                 return False
             child_len = sum(
-                len(c.get('key', '')) + len(str(c.get('val', ''))) + 5
+                len(c.get('key', '')) + len(str(c.get('val', ''))) + 4
                 for c in child_val if c['type'] == 'node'
             )
             child_len += len(child_key) + 6
         else:
-            child_len = len(child_key) + len(str(child_val or '')) + 5
+            child_len = len(child_key) + len(str(child_val or '')) + 4
         total_len += child_len
 
     if total_len > config.compact_max_chars and not cm_close:
@@ -166,6 +174,66 @@ def node_to_string(node, depth=0, *, config, be_compact=False):
     return f"{indent}{key}{op_str} {val}{cm_inline}"
 
 
+def _align_compact_runs(lines, compact_entries, depth, config):
+    """Align children across runs of consecutive same-key compact one-liners."""
+    if len(compact_entries) < 2:
+        return
+
+    runs = []
+    current_run = [compact_entries[0]]
+    for entry in compact_entries[1:]:
+        prev_entry = current_run[-1]
+        if (entry[0] == prev_entry[0] + 1 and
+                entry[1].get('key') == prev_entry[1].get('key')):
+            current_run.append(entry)
+        else:
+            if len(current_run) >= 2:
+                runs.append(current_run)
+            current_run = [entry]
+    if len(current_run) >= 2:
+        runs.append(current_run)
+
+    indent = "\t" * (depth + 1)
+    for run in runs:
+        all_child_strs = []
+        for _, nd in run:
+            child_strs = [
+                node_to_string(c, depth=-1, config=config, be_compact=True)
+                for c in nd['val'] if c.get('type') == 'node'
+            ]
+            all_child_strs.append(child_strs)
+
+        if len(set(len(cs) for cs in all_child_strs)) != 1:
+            continue
+
+        all_child_nodes = [
+            [c for c in nd['val'] if c.get('type') == 'node']
+            for _, nd in run
+        ]
+        child_keys_match = all(
+            all(cn[pos].get('key') == all_child_nodes[0][pos].get('key')
+                for cn in all_child_nodes)
+            for pos in range(len(all_child_nodes[0]))
+        )
+        if not child_keys_match:
+            continue
+
+        for pos in range(len(all_child_strs[0])):
+            max_w = max(len(cs[pos]) for cs in all_child_strs)
+            for cs in all_child_strs:
+                cs[pos] = cs[pos].ljust(max_w)
+
+        for i, (line_idx, nd) in enumerate(run):
+            key = nd.get('key')
+            op = nd.get('op')
+            cm_close = nd.get('_cm_close', '')
+            mid_key_str = f" {nd.get('mid_key')}" if nd.get('mid_key') else ""
+            op_str = f" {op}" if op else ""
+            val_key_str = f" {nd.get('val_key')}" if nd.get('val_key') else ""
+            joined = " ".join(all_child_strs[i])
+            lines[line_idx] = f"{indent}{key}{mid_key_str}{op_str}{val_key_str} {{ {joined} }}{cm_close}"
+
+
 def _block_node_to_string(node, depth, *, config, be_compact=False):
     """Format a block node (one with children in a list)."""
     indent = "\t" * depth
@@ -201,6 +269,7 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
     prev_was_comment = False
     prev_is_block = False
     prev_is_expanded = False
+    compact_entries = []
 
     for i, child in enumerate(children):
         is_comment = child.get('type') == 'comment'
@@ -218,11 +287,19 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
         ):
             lines.append("")
 
-        lines.append(node_to_string(child, depth + 1, config=config))
+        child_str = node_to_string(child, depth + 1, config=config)
+        line_idx = len(lines)
+        lines.append(child_str)
+
+        if is_block and '\n' not in child_str:
+            compact_entries.append((line_idx, child))
+
         prev_was_header = comment_is_header
         prev_was_comment = is_comment
         prev_is_block = is_block
         prev_is_expanded = is_expanded
+
+    _align_compact_runs(lines, compact_entries, depth, config)
 
     lines.append(f"{indent}}}{cm_close}")
     formatted_str = "\n".join(lines)
