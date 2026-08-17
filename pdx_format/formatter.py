@@ -78,13 +78,13 @@ def _should_add_blank_within_block(child, i, children, depth, config,
         if len(real_children) <= config.compact_limit:
             add_space = False
 
-    # Suppress blanks between consecutive compact one-liners with the same key
+    # Suppress blanks between consecutive compact one-liners with matching structure
     if add_space and is_block and not is_expanded:
         prev_node = _find_prev_non_comment(children, i)
         if (prev_node and isinstance(prev_node.get('val'), list) and
-                prev_node.get('key') == child_key and
                 not _is_expanded_block(prev_node, depth, config)):
-            add_space = False
+            if _child_signature(child) == _child_signature(prev_node):
+                add_space = False
 
     return add_space
 
@@ -174,8 +174,13 @@ def node_to_string(node, depth=0, *, config, be_compact=False):
     return f"{indent}{key}{op_str} {val}{cm_inline}"
 
 
+def _child_signature(nd):
+    """Structural signature: the tuple of child keys inside a compact one-liner."""
+    return tuple(c.get('key') for c in nd['val'] if c.get('type') == 'node')
+
+
 def _align_compact_runs(lines, compact_entries, depth, config):
-    """Align children across runs of consecutive same-key compact one-liners."""
+    """Align children across runs of consecutive structurally-matching compact one-liners."""
     if len(compact_entries) < 2:
         return
 
@@ -184,7 +189,7 @@ def _align_compact_runs(lines, compact_entries, depth, config):
     for entry in compact_entries[1:]:
         prev_entry = current_run[-1]
         if (entry[0] == prev_entry[0] + 1 and
-                entry[1].get('key') == prev_entry[1].get('key')):
+                _child_signature(entry[1]) == _child_signature(prev_entry[1])):
             current_run.append(entry)
         else:
             if len(current_run) >= 2:
@@ -203,35 +208,29 @@ def _align_compact_runs(lines, compact_entries, depth, config):
             ]
             all_child_strs.append(child_strs)
 
-        if len(set(len(cs) for cs in all_child_strs)) != 1:
-            continue
-
-        all_child_nodes = [
-            [c for c in nd['val'] if c.get('type') == 'node']
-            for _, nd in run
-        ]
-        child_keys_match = all(
-            all(cn[pos].get('key') == all_child_nodes[0][pos].get('key')
-                for cn in all_child_nodes)
-            for pos in range(len(all_child_nodes[0]))
-        )
-        if not child_keys_match:
-            continue
-
-        for pos in range(len(all_child_strs[0])):
+        num_cols = len(all_child_strs[0])
+        for pos in range(num_cols - 1):
             max_w = max(len(cs[pos]) for cs in all_child_strs)
             for cs in all_child_strs:
                 cs[pos] = cs[pos].ljust(max_w)
 
-        for i, (line_idx, nd) in enumerate(run):
+        keys = []
+        suffixes = []
+        cm_closes = []
+        for _, nd in run:
             key = nd.get('key')
-            op = nd.get('op')
-            cm_close = nd.get('_cm_close', '')
             mid_key_str = f" {nd.get('mid_key')}" if nd.get('mid_key') else ""
-            op_str = f" {op}" if op else ""
+            op_str = f" {nd.get('op')}" if nd.get('op') else ""
             val_key_str = f" {nd.get('val_key')}" if nd.get('val_key') else ""
+            keys.append(key)
+            suffixes.append(f"{mid_key_str}{op_str}{val_key_str}")
+            cm_closes.append(nd.get('_cm_close', ''))
+        max_key = max(len(k) for k in keys)
+
+        for i, (line_idx, _) in enumerate(run):
+            padded_key = keys[i].ljust(max_key)
             joined = " ".join(all_child_strs[i])
-            lines[line_idx] = f"{indent}{key}{mid_key_str}{op_str}{val_key_str} {{ {joined} }}{cm_close}"
+            lines[line_idx] = f"{indent}{padded_key}{suffixes[i]} {{ {joined} }}{cm_closes[i]}"
 
 
 def _block_node_to_string(node, depth, *, config, be_compact=False):
