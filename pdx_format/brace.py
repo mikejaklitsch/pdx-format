@@ -2,35 +2,17 @@
 
 Pinpoints which opening brace has no closer (or which closing brace has no
 opener), with surrounding context so you can see the block label.
-
-The scanner mirrors engine semantics: a comment starts at any '#' outside a
-string literal — even glued to the preceding token (`foo = bar# }` is a
-comment from '#' on). Braces inside string literals (`text = "}"`) are not
-structure. String state carries across lines: generated gfx files hold
-multi-line string blobs whose closing line is `"}`  — that close brace IS
-structural, and braces inside the blob are not.
 """
 from pathlib import Path
 
-EXTENSIONS = {".txt", ".gui"}
-SKIP_PARTS = {".claude", "__pycache__", ".git", ".gui_workspace"}
+from pdx_utilities.scanner import split_line
+from pdx_utilities.constants import CODE_EXTS, EXCLUDE_PARTS
 
 
 def structural_code(line: str, in_string: bool) -> tuple[str, bool]:
-    """Return (line with comments removed and string contents blanked,
-    string state at end of line), so only structural braces remain."""
-    out = []
-    for ch in line:
-        if ch == '"':
-            in_string = not in_string
-            out.append(" ")
-        elif in_string:
-            out.append(" ")
-        elif ch == "#":
-            break
-        else:
-            out.append(ch)
-    return "".join(out), in_string
+    """Return (masked code, string state). Wrapper around split_line."""
+    _, _, masked, in_string = split_line(line, in_string)
+    return masked, in_string
 
 
 def find_problems(text: str) -> list[tuple[int, str]]:
@@ -92,9 +74,9 @@ def collect_files(target: Path) -> list[Path]:
     if target.is_file():
         return [target]
     files = []
-    for ext in sorted(EXTENSIONS):
+    for ext in sorted(CODE_EXTS):
         files.extend(sorted(target.rglob(f"*{ext}")))
-    return [f for f in files if not SKIP_PARTS.intersection(f.parts)]
+    return [f for f in files if not EXCLUDE_PARTS.intersection(f.parts)]
 
 
 def run_check(targets: list[str], ctx: int = 2, quiet: bool = False) -> int:

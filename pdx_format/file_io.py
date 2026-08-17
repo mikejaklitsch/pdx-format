@@ -60,20 +60,13 @@ def process_text(content, config, filepath=None):
         return content, False
 
 
-def _read_file_with_bom(filepath):
-    """Read a file, detecting BOM. Returns (content, has_bom)."""
-    with open(filepath, 'rb') as f:
-        has_bom = f.read(3) == b'\xef\xbb\xbf'
-    with open(filepath, 'r', encoding='utf-8-sig') as f:
-        content = f.read()
-    return content, has_bom
+from pdx_utilities.fileio import read_with_bom as _read_file_with_bom  # noqa: E402
+from pdx_utilities.fileio import write_with_bom as _write_with_bom  # noqa: E402
 
 
 def _write_file(filepath, content, want_bom):
     """Write content to file with optional BOM."""
-    encoding = 'utf-8-sig' if want_bom else 'utf-8'
-    with open(filepath, 'w', encoding=encoding, newline='\n') as f:
-        f.write(content)
+    _write_with_bom(filepath, content, bom=want_bom)
 
 
 def bom_only_file(filepath, config, check_only=False, show_diff=False):
