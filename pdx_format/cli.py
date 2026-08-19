@@ -27,7 +27,7 @@ def expand_targets(paths, extensions, quiet=False):
             for ext in sorted(extensions):
                 found.extend(sorted(p.rglob(f"*{ext}")))
             files.extend(str(f) for f in found
-                         if not brace.SKIP_PARTS.intersection(f.parts))
+                         if not brace.EXCLUDE_PARTS.intersection(f.parts))
         else:
             missing += 1
             if not quiet:
