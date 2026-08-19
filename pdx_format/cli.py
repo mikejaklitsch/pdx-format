@@ -145,3 +145,11 @@ Examples:
     if args.check and needs_formatting:
         sys.exit(1)
     sys.exit(1 if errors else 0)
+
+
+def brace_main():
+    if len(sys.argv) < 2:
+        print("Usage: pdx-brace <file|dir> [--context N]")
+        sys.exit(1)
+    sys.argv = [sys.argv[0], '--brace'] + sys.argv[1:]
+    main()
