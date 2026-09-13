@@ -1,6 +1,6 @@
 """Keyword sets and constant tuples for PDX script formatting."""
 
-RAW_BLOCKS = ('in_breach_of', 'inverted_switch')
+from pdx_utilities.script_parser import RAW_BLOCKS  # noqa: E402,F401  (listed with the shared parser)
 
 KEYWORDS_TO_LOWER_START = ('ROOT.', 'PREV.', 'FROM.', 'OWNER.', 'CONTROLLER.')
 KEYWORDS_TO_LOWER_END = ('.ROOT', '.PREV', '.FROM', '.OWNER', '.CONTROLLER')
