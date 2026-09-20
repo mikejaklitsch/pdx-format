@@ -394,7 +394,11 @@ def block_to_string(block_list, config):
         cm_open = node.get('_cm_open')
         node_to_print = node
         if node['type'] == 'node' and is_block and cm_open:
+            # Hoist the brace-line comment above the block. Add the blank line a
+            # standalone comment gets before a block, so the next pass, which
+            # parses the hoisted comment as standalone, changes nothing.
             lines.append(cm_open.strip())
+            lines.append("")
             node_to_print = node.copy()
             del node_to_print['_cm_open']
 
