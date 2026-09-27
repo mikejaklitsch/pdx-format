@@ -6,6 +6,16 @@ from .constants import (
 )
 
 
+def _block_head(node, key=None):
+    """Render `key mid_key op val_key {`; a keyless block renders as a bare `{`."""
+    key = node.get('key') if key is None else key
+    mid_key_str = f" {node.get('mid_key')}" if node.get('mid_key') else ""
+    op_str = f" {node.get('op')}" if node.get('op') else ""
+    val_key_str = f" {node.get('val_key')}" if node.get('val_key') else ""
+    head = f"{key}{mid_key_str}{op_str}{val_key_str}"
+    return f"{head} {{" if head else "{"
+
+
 def _find_prev_non_comment(children, i):
     """Walk backwards to find the previous non-comment node."""
     for j in range(i - 1, -1, -1):
@@ -78,18 +88,73 @@ def _should_add_blank_within_block(child, i, children, depth, config,
         if len(real_children) <= config.compact_limit:
             add_space = False
 
-    # Suppress blanks between consecutive compact one-liners with matching structure
-    if add_space and is_block and not is_expanded:
+    # The two rules below stop the formatter from inserting a blank; a blank
+    # the author typed stays.
+    user_blank = bool(child.get('_blank_before'))
+
+    # Suppress blank after limit inside conditionals
+    if add_space and prev_is_expanded and not user_blank:
         prev_node = _find_prev_non_comment(children, i)
-        if (prev_node and isinstance(prev_node.get('val'), list) and
-                not _is_expanded_block(prev_node, depth, config)):
-            if _child_signature(child) == _child_signature(prev_node):
-                add_space = False
+        if prev_node and prev_node.get('key') in ('limit', 'trigger'):
+            add_space = False
+
+    # Suppress blanks between consecutive compact one-liners (scalars or compact blocks)
+    if add_space and not is_expanded and not user_blank:
+        prev_node = _find_prev_non_comment(children, i)
+        if prev_node and not _is_expanded_block(prev_node, depth, config):
+            add_space = False
 
     return add_space
 
 
-def should_be_compact(node, config):
+def _find_if_else_chain(node, siblings):
+    """Find all block nodes in the if/else_if/else chain containing node."""
+    key = node.get('key', '')
+    if key not in ('if', 'else_if', 'else'):
+        return None
+
+    idx = None
+    for i, s in enumerate(siblings):
+        if s is node:
+            idx = i
+            break
+    if idx is None:
+        return None
+
+    def _adjacent_block(from_idx, direction):
+        j = from_idx + direction
+        while 0 <= j < len(siblings):
+            if siblings[j].get('type') != 'comment':
+                return siblings[j].get('key', ''), j
+            j += direction
+        return None, None
+
+    chain_indices = [idx]
+    j, current_key = idx, key
+    while current_key in ('else', 'else_if'):
+        pk, pi = _adjacent_block(j, -1)
+        if pk in ('if', 'else_if'):
+            chain_indices.insert(0, pi)
+            current_key = pk
+            j = pi
+        else:
+            break
+
+    j = idx
+    while True:
+        nk, ni = _adjacent_block(j, 1)
+        if nk in ('else_if', 'else'):
+            chain_indices.append(ni)
+            j = ni
+        else:
+            break
+
+    if len(chain_indices) < 2:
+        return None
+    return [siblings[i] for i in chain_indices]
+
+
+def should_be_compact(node, config, siblings=None):
     """Determine if a block node should be rendered on a single line."""
     if node.get('type') != 'node':
         return False
@@ -99,6 +164,10 @@ def should_be_compact(node, config):
 
     key = node.get('key', '')
     cm_close = node.get('_cm_close', "")
+
+    # A comment after the opening brace has no place on a one-line block
+    if node.get('_cm_open'):
+        return False
 
     # Any child comment prevents compacting
     for c in val:
@@ -137,10 +206,18 @@ def should_be_compact(node, config):
 
     if total_len > config.compact_max_chars and not cm_close:
         return False
+
+    if siblings is not None:
+        chain = _find_if_else_chain(node, siblings)
+        if chain is not None:
+            for member in chain:
+                if member is not node and not should_be_compact(member, config):
+                    return False
+
     return True
 
 
-def node_to_string(node, depth=0, *, config, be_compact=False):
+def node_to_string(node, depth=0, *, config, be_compact=False, siblings=None):
     """Convert a single AST node to its formatted string representation."""
     indent = "\t" * depth
 
@@ -161,7 +238,7 @@ def node_to_string(node, depth=0, *, config, be_compact=False):
 
     # Block node (has children)
     if isinstance(node.get('val'), list):
-        return _block_node_to_string(node, depth, config=config, be_compact=be_compact)
+        return _block_node_to_string(node, depth, config=config, be_compact=be_compact, siblings=siblings)
 
     # Scalar node
     val = node.get('val')
@@ -214,26 +291,17 @@ def _align_compact_runs(lines, compact_entries, depth, config):
             for cs in all_child_strs:
                 cs[pos] = cs[pos].ljust(max_w)
 
-        keys = []
-        suffixes = []
-        cm_closes = []
-        for _, nd in run:
-            key = nd.get('key')
-            mid_key_str = f" {nd.get('mid_key')}" if nd.get('mid_key') else ""
-            op_str = f" {nd.get('op')}" if nd.get('op') else ""
-            val_key_str = f" {nd.get('val_key')}" if nd.get('val_key') else ""
-            keys.append(key)
-            suffixes.append(f"{mid_key_str}{op_str}{val_key_str}")
-            cm_closes.append(nd.get('_cm_close', ''))
+        keys = [nd.get('key') for _, nd in run]
+        cm_closes = [nd.get('_cm_close', '') for _, nd in run]
         max_key = max(len(k) for k in keys)
 
-        for i, (line_idx, _) in enumerate(run):
-            padded_key = keys[i].ljust(max_key)
+        for i, (line_idx, nd) in enumerate(run):
+            head = _block_head(nd, key=keys[i].ljust(max_key))
             joined = " ".join(all_child_strs[i])
-            lines[line_idx] = f"{indent}{padded_key}{suffixes[i]} {{ {joined} }}{cm_closes[i]}"
+            lines[line_idx] = f"{indent}{head} {joined} }}{cm_closes[i]}"
 
 
-def _block_node_to_string(node, depth, *, config, be_compact=False):
+def _block_node_to_string(node, depth, *, config, be_compact=False, siblings=None):
     """Format a block node (one with children in a list)."""
     indent = "\t" * depth
     key = node.get('key')
@@ -246,7 +314,7 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
     is_compactable = False
     if (not config.no_compact and not be_compact and depth and
             not key.endswith(NON_COMPACT_SUFFIXES)):
-        is_compactable = should_be_compact(node, config)
+        is_compactable = should_be_compact(node, config, siblings=siblings)
 
     if be_compact or is_compactable:
         result = _try_compact_render(node, children, depth, config, be_compact, cm_close)
@@ -254,15 +322,11 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
             return result
 
     # Expanded rendering
-    mid_key_str = f" {node.get('mid_key')}" if node.get('mid_key') else ""
-    op_str = f" {op}" if op else ""
-    val_key_str = f" {node.get('val_key')}" if node.get('val_key') else ""
-
     # GUI 'types' declarations need brace on new line
-    if key == 'types' and val_key_str and not op:
-        lines = [f"{indent}{key}{val_key_str}", f"{indent}{{{cm_open}"]
+    if key == 'types' and node.get('val_key') and not op:
+        lines = [f"{indent}{key} {node.get('val_key')}", f"{indent}{{{cm_open}"]
     else:
-        lines = [f"{indent}{key}{mid_key_str}{op_str}{val_key_str} {{{cm_open}"]
+        lines = [f"{indent}{_block_head(node)}{cm_open}"]
 
     prev_was_header = False
     prev_was_comment = False
@@ -286,7 +350,7 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
         ):
             lines.append("")
 
-        child_str = node_to_string(child, depth + 1, config=config)
+        child_str = node_to_string(child, depth + 1, config=config, siblings=children)
         line_idx = len(lines)
         lines.append(child_str)
 
@@ -315,6 +379,8 @@ def _block_node_to_string(node, depth, *, config, be_compact=False):
 
 def _try_compact_render(node, children, depth, config, be_compact, cm_close):
     """Try to render a block node as a single compact line. Returns string or None."""
+    if node.get('_cm_open'):
+        return None
     indent = "\t" * depth
     key = node.get('key')
     op = node.get('op')
@@ -340,10 +406,7 @@ def _try_compact_render(node, children, depth, config, be_compact, cm_close):
         return None
 
     joined = " ".join(child_strs)
-    mid_key_str = f" {node.get('mid_key')}" if node.get('mid_key') else ""
-    op_str = f" {op}" if op else ""
-    val_key_str = f" {node.get('val_key')}" if node.get('val_key') else ""
-    return f"{indent}{key}{mid_key_str}{op_str}{val_key_str} {{ {joined} }}{cm_close}"
+    return f"{indent}{_block_head(node)} {joined} }}{cm_close}"
 
 
 def block_to_string(block_list, config):
@@ -373,12 +436,20 @@ def block_to_string(block_list, config):
             elif node['type'] == 'raw_block':
                 is_block = True
 
-        add_space = (
-            (not is_comment and not is_var and
-             (not prev_was_comment or prev_was_header or is_block)) or
-            (comment_is_header and not prev_was_comment and i) or
-            (is_comment and prev_is_block)
-        )
+        cm_open = node.get('_cm_open')
+        hoisted = node['type'] == 'node' and is_block and cm_open
+        if hoisted:
+            # The hoisted brace-line comment prints first, and the next pass
+            # parses it as a standalone comment; space it as one.
+            hoisted_header = cm_open.strip()[1:].startswith(('#', '}', ' }'))
+            add_space = (hoisted_header and not prev_was_comment and i) or prev_is_block
+        else:
+            add_space = (
+                (not is_comment and not is_var and
+                 (not prev_was_comment or prev_was_header or is_block)) or
+                (comment_is_header and not prev_was_comment and i) or
+                (is_comment and prev_is_block)
+            )
         # Preserve user's intentional blank lines
         if not add_space and i and node.get('_blank_before'):
             add_space = True
@@ -391,9 +462,8 @@ def block_to_string(block_list, config):
         prev_was_comment = is_comment
         prev_is_block = is_block
 
-        cm_open = node.get('_cm_open')
         node_to_print = node
-        if node['type'] == 'node' and is_block and cm_open:
+        if hoisted:
             # Hoist the brace-line comment above the block. Add the blank line a
             # standalone comment gets before a block, so the next pass, which
             # parses the hoisted comment as standalone, changes nothing.

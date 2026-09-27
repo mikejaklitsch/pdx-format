@@ -21,6 +21,39 @@ def _print_brace_pinpoint(content, label, limit=3):
               f"(run: pdx-format --brace {label})", file=sys.stderr)
 
 
+def _name_keyless(nodes):
+    """Give keyless blocks (`{ 0.0 1.0 }` in a list) an empty key for the formatter."""
+    for node in nodes:
+        if node.get('type') == 'node':
+            if node.get('key') is None:
+                node['key'] = ''
+            if isinstance(node.get('val'), list):
+                _name_keyless(node['val'])
+
+
+def _content_mismatch(before, after):
+    """Describe how two token streams differ in content, or return None.
+
+    Code tokens must match in order; the key transforms only change case.
+    Comments must match as a multiset, because a brace-line comment can be
+    hoisted above its block.
+    """
+    code_a = [t['val'].lower() for t in before if t['type'] != 'comment']
+    code_b = [t['val'].lower() for t in after if t['type'] != 'comment']
+    if code_a != code_b:
+        for i, (a, b) in enumerate(zip(code_a, code_b)):
+            if a != b:
+                return f"code token {i}: {a!r} became {b!r}"
+        return f"code token count {len(code_a)} became {len(code_b)}"
+    com_a = sorted(t['val'].rstrip() for t in before if t['type'] == 'comment')
+    com_b = sorted(t['val'].rstrip() for t in after if t['type'] == 'comment')
+    if com_a != com_b:
+        missing = set(com_a) - set(com_b)
+        sample = next(iter(missing)) if missing else ''
+        return f"{len(com_a)} comments became {len(com_b)}; lost {sample!r}"
+    return None
+
+
 def process_text(content, config, filepath=None):
     """Format PDX script text. Returns (new_content, changed)."""
     label = filepath or "<input>"
@@ -38,7 +71,8 @@ def process_text(content, config, filepath=None):
             _print_brace_pinpoint(content, label)
             return content, False
 
-        tree = parse(tokens, content)
+        tree = parse(tokens, content, keyless=True)
+        _name_keyless(tree)
         lowercase_keys(tree)
         uppercase_keys(tree)
         lowercase_yes_no_values(tree)
@@ -46,6 +80,12 @@ def process_text(content, config, filepath=None):
         new_content = block_to_string(tree, config)
         if new_content and not new_content.endswith('\n'):
             new_content += '\n'
+
+        lost = _content_mismatch(tokens, tokenize(new_content))
+        if lost:
+            print(f"Error: {label}: formatting would change content ({lost}), "
+                  f"skipping to prevent data loss", file=sys.stderr)
+            return original_content, False
 
         if new_content != original_content:
             return new_content, True
