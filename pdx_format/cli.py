@@ -14,13 +14,21 @@ FORMAT_EXTENSIONS = {'.txt', '.gui'} | BOM_ONLY_EXTENSIONS
 def expand_targets(paths, extensions, quiet=False):
     """Expand files and directories into a flat file list. Directories are
     searched recursively for matching extensions, skipping tool/VCS dirs.
-    Returns (files, missing_count)."""
+    A named file with another extension (.json, for example) is refused:
+    the formatter would rewrite it as Paradox script.
+    Returns (files, missing_count), where missing counts refused files too."""
     from pathlib import Path
     files = []
     missing = 0
     for raw in paths:
         p = Path(raw)
         if p.is_file():
+            if p.suffix.lower() not in extensions:
+                missing += 1
+                if not quiet:
+                    print(f"Skipped {raw}: pdx-format handles only "
+                          f"{', '.join(sorted(extensions))} files", file=sys.stderr)
+                continue
             files.append(raw)
         elif p.is_dir():
             found = []
